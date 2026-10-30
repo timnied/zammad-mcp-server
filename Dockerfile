@@ -25,7 +25,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MCP_TRANSPORT=http \
     MCP_SERVER_HOST=0.0.0.0 \
     MCP_SERVER_PORT=8000 \
-    MCP_SERVER_PATH=/mcp
+    MCP_SERVER_PATH=/mcp \
+    FASTMCP_CHECK_FOR_UPDATES=off \
+    FASTMCP_SHOW_SERVER_BANNER=false
 
 COPY --from=builder /app/.venv /app/.venv
 

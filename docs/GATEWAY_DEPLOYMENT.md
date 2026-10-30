@@ -67,7 +67,7 @@ Rules the code enforces:
 `deploy/compose.agentgateway.yaml` builds the image from `uv.lock` (reproducible), runs it as
 an unprivileged user, read-only, without capabilities and **without a published port**, and
 reads the Zammad token and the proxy secret from files (`ZAMMAD_HTTP_TOKEN_FILE`,
-`MCP_OBO_PROXY_SECRET_FILE`). For an internal CA mount the CA file and set `SSL_CERT_FILE`.
+`MCP_OBO_PROXY_SECRET_FILE`). With a public CA (e.g. GlobalSign) nothing is needed. For an internal CA see the commented `SSL_CERT_FILE` and `ca/` lines in the compose file.
 `deploy/agentgateway-target.snippet.yaml` shows the gateway side.
 
 ## 4. Acceptance checklist on the real system

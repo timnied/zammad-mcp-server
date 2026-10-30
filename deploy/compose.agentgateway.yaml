@@ -6,11 +6,12 @@
 #
 # Usage:
 #   cd deploy
-#   mkdir -p secrets ca
+#   mkdir -p secrets
 #   printf '%s' '<zammad service account token>' > secrets/zammad_token
 #   openssl rand -hex 32 | tr -d '\n' > secrets/mcp_proxy_secret   # also put it in the gateway config
 #   sudo chown 10001:10001 secrets/* && sudo chmod 400 secrets/*   # uid of the container user
-#   cp /path/to/internal-ca.pem ca/internal-ca.pem                  # only if Zammad uses an internal CA
+#   (Zammad behind a public CA, e.g. a GlobalSign wildcard: nothing else to do. Only for an
+#    internal CA see the commented SSL_CERT_FILE / ca/ lines below.)
 #   docker compose -f compose.agentgateway.yaml up -d --build
 
 services:
@@ -27,7 +28,9 @@ services:
       # --- Zammad (service account; base URL WITHOUT /api/v1) ---
       ZAMMAD_URL: "https://ticket.example.internal"
       ZAMMAD_HTTP_TOKEN_FILE: /run/secrets/zammad_token
-      SSL_CERT_FILE: /etc/ssl/internal-ca.pem   # remove if Zammad uses a public CA
+      # Only if Zammad uses an INTERNAL CA: mount the CA file (see volumes) and uncomment.
+      # The file must exist before "up", otherwise Docker creates a directory with that name.
+      # SSL_CERT_FILE: /etc/ssl/internal-ca.pem
 
       # --- What the model may do ---
       MCP_PROFILE: helpdesk                  # readonly | helpdesk | full
@@ -43,8 +46,8 @@ services:
     secrets:
       - zammad_token
       - mcp_proxy_secret
-    volumes:
-      - ./ca/internal-ca.pem:/etc/ssl/internal-ca.pem:ro
+    # volumes:                                       # internal CA only (see SSL_CERT_FILE above)
+    #   - ./ca/internal-ca.pem:/etc/ssl/internal-ca.pem:ro
     networks:
       - mcp
     read_only: true

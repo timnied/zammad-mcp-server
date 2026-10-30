@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import base64
+import logging
+import os
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -10,10 +13,11 @@ from typing import Any
 import structlog
 from fastmcp import FastMCP
 
-from zammad_mcp_server.access_control import AccessController, Permission
+from zammad_mcp_server.access_control import REGISTERED_TOOLS, AccessController, Permission
 from zammad_mcp_server.cli import parse_server_args, run_server
 from zammad_mcp_server.client import NotFoundError, ZammadClient
 from zammad_mcp_server.formatting import html_to_text, with_body_plain
+from zammad_mcp_server.identity import OboConfig, resolve_identity
 from zammad_mcp_server.models import (
     ArticleCreateRequest,
     ArticleType,
@@ -58,10 +62,22 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         _client = ZammadClient()
         _access_controller = AccessController.from_env()
 
+        # Blocked tools are not just refused at call time, they disappear from
+        # tools/list so the model never sees or tries them. Re-enable first so the
+        # result depends only on the current policy (idempotent across restarts).
+        blocked = _access_controller.get_blocked_tools()
+        server.enable(names=set(REGISTERED_TOOLS), components={"tool"})
+        if blocked:
+            server.disable(names=set(blocked), components={"tool"})
+
         logger.info(
             "server_initialized",
             url=_client.url,
+            profile=_access_controller.policy.profile.value,
+            article_policy=_access_controller.policy.article_policy,
+            on_behalf_of=_client.obo.source,
             allowed_tools=len(_access_controller.get_allowed_tools()),
+            blocked_tools=blocked,
         )
 
         yield {"client": _client, "access_controller": _access_controller}
@@ -75,6 +91,9 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         if _client:
             _client.close()
             logger.info("client_closed")
+        # Reset so a restarted lifespan (or the next test) never sees stale state.
+        _client = None
+        _access_controller = None
 
 
 # Create FastMCP instance
@@ -84,11 +103,24 @@ mcp = FastMCP(
 )
 
 
+def _current_user() -> str | None:
+    """Caller identity for the current request (None when on-behalf-of is off)."""
+    config = _client.obo if _client is not None else OboConfig.from_env()
+    return resolve_identity(config)
+
+
 # Helper function to check access
 def check_access(tool_name: str, required_permission: Permission) -> None:
     """Check if access is allowed for a tool."""
     controller = get_access_controller()
-    controller.consume_rate_limit()
+    try:
+        # Fails closed (IdentityError) when on-behalf-of is enabled and the request
+        # carries no valid identity - before any rate limit, log entry or API call.
+        user = _current_user()
+    except PermissionError as exc:
+        controller.log_access(tool_name, False, {"user": None, "reason": str(exc)})
+        raise
+    controller.consume_rate_limit(user)
     allowed = False
 
     if required_permission == Permission.ADMIN:
@@ -98,10 +130,22 @@ def check_access(tool_name: str, required_permission: Permission) -> None:
     elif required_permission == Permission.READ_ONLY:
         allowed = controller.can_read(tool_name)
 
-    controller.log_access(tool_name, allowed)
+    controller.log_access(tool_name, allowed, {"user": user} if user else None)
 
     if not allowed:
         raise PermissionError(f"Access denied for tool: {tool_name}")
+
+
+INTERNAL_NOTE_MESSAGE = (
+    "Server policy: articles are always created as internal notes (never sent to customers)."
+)
+
+
+def _enforce_article_policy(article_type: str, internal: bool) -> tuple[str, bool, bool]:
+    """Apply MCP_ARTICLE_POLICY. Returns (type, internal, was_changed)."""
+    if get_access_controller().policy.article_policy != "internal_only":
+        return article_type, internal, False
+    return "note", True, (article_type != "note" or not internal)
 
 
 def _parse_uploads(raw: list[dict[str, str]] | None) -> list[AttachmentUpload] | None:
@@ -282,6 +326,7 @@ def create_ticket(
     check_access("create_ticket", Permission.WRITE)
     get_access_controller().assert_group_allowed(group)
     client = get_client()
+    article_type, article_internal, _ = _enforce_article_policy(article_type, article_internal)
 
     try:
         article_type_enum = ArticleType(article_type)
@@ -417,11 +462,19 @@ def create_article(
     cc: str | None = None,
     attachments: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Add a note, email, phone, or web article. Attachments: filename, data (base64), mime-type."""
+    """Add an article (default: note) to a ticket. internal=True keeps it staff-only.
+
+    Server policy may force every article to be an internal note. Attachments:
+    filename, data (base64), mime-type.
+    """
     check_access("create_article", Permission.WRITE)
     client = get_client()
     ticket = client.get_ticket(ticket_id)
     _assert_ticket_in_scope(ticket)
+
+    type, internal, coerced = _enforce_article_policy(type, internal)
+    if coerced:
+        to = cc = None  # an internal note has no recipients
 
     try:
         article_type_enum = ArticleType(type)
@@ -440,7 +493,10 @@ def create_article(
     )
 
     article = client.create_article(request)
-    return with_body_plain(article.model_dump())
+    result = with_body_plain(article.model_dump())
+    if coerced:
+        result["policy_note"] = INTERNAL_NOTE_MESSAGE
+    return result
 
 
 @mcp.tool()
@@ -1237,6 +1293,14 @@ def escalation_summary(group: str, locale: str) -> str:
 def main() -> None:
     """Run the MCP server."""
     args = parse_server_args()
+
+    # structlog's stdlib filter drops everything below the root logger level (WARNING by
+    # default), which silently discarded the info-level audit trail ("mcp_access").
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=os.getenv("MCP_LOG_LEVEL", "INFO").upper(),
+        format="%(message)s",
+    )
 
     structlog.configure(
         processors=[

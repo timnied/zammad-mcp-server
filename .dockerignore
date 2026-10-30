@@ -37,3 +37,7 @@ CONTRIBUTING.md
 
 # Docker
 docker/volumes/
+
+# Windows binary shipped in the repo, not needed in the image
+*.exe
+deploy/

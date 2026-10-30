@@ -1,0 +1,76 @@
+# Zammad MCP server next to agentgateway on the same Docker host.
+#
+# Traffic path:  Claude -> bridge -> nginx (TLS) -> agentgateway -> THIS container (HTTP)
+# The only unencrypted hop is gateway -> zammad-mcp over the internal Docker network of
+# the VM. The container publishes NO port to the host.
+#
+# Usage:
+#   cd deploy
+#   mkdir -p secrets ca
+#   printf '%s' '<zammad service account token>' > secrets/zammad_token
+#   openssl rand -hex 32 | tr -d '\n' > secrets/mcp_proxy_secret   # also put it in the gateway config
+#   sudo chown 10001:10001 secrets/* && sudo chmod 400 secrets/*   # uid of the container user
+#   cp /path/to/internal-ca.pem ca/internal-ca.pem                  # only if Zammad uses an internal CA
+#   docker compose -f compose.agentgateway.yaml up -d --build
+
+services:
+  zammad-mcp:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: indico/zammad-mcp-server:local
+    container_name: zammad-mcp
+    restart: unless-stopped
+    expose:
+      - "8000"            # reachable by containers on the shared network only; never "ports:"
+    environment:
+      # --- Zammad (service account; base URL WITHOUT /api/v1) ---
+      ZAMMAD_URL: "https://ticket.example.internal"
+      ZAMMAD_HTTP_TOKEN_FILE: /run/secrets/zammad_token
+      SSL_CERT_FILE: /etc/ssl/internal-ca.pem   # remove if Zammad uses a public CA
+
+      # --- What the model may do ---
+      MCP_PROFILE: helpdesk                  # readonly | helpdesk | full
+      MCP_ARTICLE_POLICY: internal_only      # every article becomes an internal note
+      MCP_DENIED_TOOLS: ""                   # optional extra names/patterns, e.g. "link_tickets"
+      MCP_RATE_LIMIT_PER_MINUTE: "60"        # per user
+
+      # --- Who is acting (Zammad X-On-Behalf-Of) ---
+      MCP_OBO_SOURCE: header
+      MCP_OBO_HEADER: x-mcp-user
+      MCP_OBO_ALLOWED_DOMAINS: indico-solutions.com
+      MCP_OBO_PROXY_SECRET_FILE: /run/secrets/mcp_proxy_secret
+    secrets:
+      - zammad_token
+      - mcp_proxy_secret
+    volumes:
+      - ./ca/internal-ca.pem:/etc/ssl/internal-ca.pem:ro
+    networks:
+      - mcp
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+secrets:
+  zammad_token:
+    file: ./secrets/zammad_token
+  mcp_proxy_secret:
+    file: ./secrets/mcp_proxy_secret
+
+networks:
+  mcp:
+    # The Docker network agentgateway is attached to (docker network ls). Both containers
+    # must share it so the gateway can reach http://zammad-mcp:8000/mcp.
+    external: true
+    name: agentgateway_default

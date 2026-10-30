@@ -153,6 +153,13 @@ MCP_ALLOWED_CATEGORIES=all
 MCP_DENIED_TOOLS=delete_ticket,delete_user
 ```
 
+> **Fork note (Indico Solutions):** this fork defaults to `MCP_PROFILE=helpdesk` and
+> `MCP_ARTICLE_POLICY=internal_only` (no deletes/merges/user changes, articles are always
+> internal notes), enforces `MCP_DENIED_TOOLS` and supports Zammad `X-On-Behalf-Of` per
+> request. For the gateway deployment see
+> [docs/GATEWAY_DEPLOYMENT.md](docs/GATEWAY_DEPLOYMENT.md). Set `MCP_PROFILE=full` to get
+> the upstream behaviour.
+
 ### Running the Server
 
 ```bash

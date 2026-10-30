@@ -79,6 +79,95 @@ TOOL_CATEGORIES: dict[str, ToolCategory] = {
 REGISTERED_TOOLS: frozenset[str] = frozenset(TOOL_CATEGORIES)
 
 
+class Profile(Enum):
+    """Built-in tool profiles (coarse safety presets)."""
+
+    READONLY = "readonly"
+    HELPDESK = "helpdesk"
+    FULL = "full"
+
+
+# Permission level each tool demands (must match the check_access() call in server.py;
+# tests/test_access_control.py verifies this against the source).
+TOOL_REQUIRED_PERMISSION: dict[str, Permission] = {
+    **dict.fromkeys(
+        (
+            "get_ticket",
+            "search_tickets",
+            "get_ticket_articles",
+            "get_ticket_stats",
+            "summarize_ticket",
+            "list_ticket_tags",
+            "get_article_attachment",
+            "get_user",
+            "search_users",
+            "get_current_user",
+            "get_organization",
+            "search_organizations",
+            "get_group",
+            "list_groups",
+            "get_ticket_states",
+            "get_priorities",
+            "list_tags",
+            "health_check",
+            "get_server_info",
+            "get_allowed_tools",
+        ),
+        Permission.READ_ONLY,
+    ),
+    **dict.fromkeys(
+        (
+            "create_ticket",
+            "update_ticket",
+            "create_article",
+            "link_tickets",
+            "add_ticket_tag",
+            "remove_ticket_tag",
+            "create_user",
+            "update_user",
+            "create_organization",
+            "update_organization",
+            "create_group",
+        ),
+        Permission.WRITE,
+    ),
+    **dict.fromkeys(
+        ("delete_ticket", "delete_user", "delete_organization", "merge_tickets"),
+        Permission.ADMIN,
+    ),
+}
+
+# Irreversible or destructive operations. Blocked in the readonly and helpdesk profiles.
+DESTRUCTIVE_TOOLS: frozenset[str] = frozenset(
+    {"delete_ticket", "delete_user", "delete_organization", "merge_tickets"}
+)
+
+# Operations that change who/what exists in Zammad (accounts, organizations, groups).
+# With an on-behalf-of service account these are the most sensitive writes, so the
+# helpdesk profile blocks them too.
+DIRECTORY_MUTATION_TOOLS: frozenset[str] = frozenset(
+    {
+        "create_user",
+        "update_user",
+        "create_organization",
+        "update_organization",
+        "create_group",
+    }
+)
+
+
+def _parse_profile(raw: str) -> Profile:
+    try:
+        return Profile(raw.strip().lower())
+    except ValueError as exc:
+        valid = ", ".join(p.value for p in Profile)
+        raise ValueError(f"Unknown MCP_PROFILE: {raw!r} (valid: {valid})") from exc
+
+
+def _split_csv(raw: str) -> set[str]:
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
 def _parse_permission_name(raw: str) -> Permission:
     mapping = {
         "denied": Permission.DENIED,
@@ -102,6 +191,13 @@ class AccessPolicy:
     category_permissions: dict[ToolCategory, Permission] = field(default_factory=dict)
     tool_permissions: dict[str, Permission] = field(default_factory=dict)
     denied_tools: set[str] = field(default_factory=set)
+    # Explicit allow-list (names or fnmatch patterns). None = no allow-list.
+    # When set, every tool that does not match is denied (default-deny).
+    allowed_tools: set[str] | None = None
+    profile: Profile = Profile.FULL
+    # "any": the model may choose article type/visibility. "internal_only": every
+    # article created through the server is forced to be an internal note.
+    article_policy: str = "any"
     allowed_groups: set[str] | None = None
     allowed_organizations: set[int] | None = None
     rate_limit_per_minute: int = 60
@@ -123,7 +219,7 @@ class AccessController:
         """Initialize with an access policy."""
         self.policy = policy or AccessPolicy()
         self._access_log: list[dict[str, Any]] = []
-        self._call_times: list[float] = []
+        self._call_times: dict[str | None, list[float]] = {}
 
     def can_execute(self, tool_name: str) -> bool:
         """Check if a tool can be executed."""
@@ -134,37 +230,66 @@ class AccessController:
 
     def can_read(self, tool_name: str) -> bool:
         """Check if read operations are allowed."""
+        if not self.can_execute(tool_name):
+            return False
         permission = self._get_permission(tool_name)
         return permission in (Permission.READ_ONLY, Permission.WRITE, Permission.ADMIN)
 
     def can_write(self, tool_name: str) -> bool:
         """Check if write operations are allowed."""
+        if not self.can_execute(tool_name):
+            return False
         permission = self._get_permission(tool_name)
         return permission in (Permission.WRITE, Permission.ADMIN)
 
     def can_admin(self, tool_name: str) -> bool:
         """Check if admin operations are allowed."""
+        if not self.can_execute(tool_name):
+            return False
         permission = self._get_permission(tool_name)
         return permission == Permission.ADMIN
 
-    def consume_rate_limit(self) -> None:
-        """Raise PermissionError when the sliding-window limit is exceeded."""
+    def consume_rate_limit(self, user: str | None = None) -> None:
+        """Raise PermissionError when the sliding-window limit is exceeded.
+
+        The window is kept per user when an on-behalf-of identity is known, so one
+        busy user cannot exhaust the budget of everyone else.
+        """
         limit = self.policy.rate_limit_per_minute
         if limit <= 0:
             return
         now = time.time()
-        self._call_times = [stamp for stamp in self._call_times if now - stamp < 60.0]
-        if len(self._call_times) >= limit:
+        times = [stamp for stamp in self._call_times.get(user, []) if now - stamp < 60.0]
+        if len(times) >= limit:
+            self._call_times[user] = times
             raise PermissionError(
                 f"Rate limit exceeded ({limit} calls/minute). Retry after a short wait."
             )
-        self._call_times.append(now)
+        times.append(now)
+        self._call_times[user] = times
 
     def _is_denied(self, tool_name: str) -> bool:
-        """Check if tool is explicitly denied."""
-        if tool_name in self.policy.denied_tools:
+        """True when the tool is blocked by deny list, allow-list or profile.
+
+        Deny always wins: MCP_DENIED_TOOLS beats MCP_ALLOWED_TOOLS beats the profile.
+        Unknown tool names are denied whenever an allow-list or a restrictive profile
+        is active (fail closed).
+        """
+        if any(fnmatch.fnmatchcase(tool_name, p) for p in self.policy.denied_tools):
             return True
-        return any(fnmatch.fnmatch(tool_name, pattern) for pattern in self.policy.denied_tools)
+        allow = self.policy.allowed_tools
+        if allow is not None and not any(fnmatch.fnmatchcase(tool_name, p) for p in allow):
+            return True
+        profile = self.policy.profile
+        if profile is Profile.FULL:
+            return False
+        if tool_name not in TOOL_REQUIRED_PERMISSION:
+            return True
+        if tool_name in DESTRUCTIVE_TOOLS or tool_name in DIRECTORY_MUTATION_TOOLS:
+            return True
+        if profile is Profile.READONLY:
+            return TOOL_REQUIRED_PERMISSION[tool_name] is not Permission.READ_ONLY
+        return False
 
     def _get_permission(self, tool_name: str) -> Permission:
         """Get the permission level for a tool."""
@@ -256,8 +381,22 @@ class AccessController:
                 else:
                     category_permissions[cat] = Permission.DENIED
 
-        denied_tools_str = os.getenv("MCP_DENIED_TOOLS", "")
-        denied_tools = {tool.strip() for tool in denied_tools_str.split(",") if tool.strip()}
+        denied_tools = _split_csv(os.getenv("MCP_DENIED_TOOLS", ""))
+
+        allowed_tools_raw = os.getenv("MCP_ALLOWED_TOOLS", "")
+        allowed_tools = _split_csv(allowed_tools_raw) if allowed_tools_raw.strip() else None
+
+        # Secure by default: without MCP_PROFILE the helpdesk profile is used
+        # (reads + ticket/article/tag writes; no deletes, merges or directory changes).
+        profile = _parse_profile(os.getenv("MCP_PROFILE", "helpdesk"))
+
+        article_policy = os.getenv("MCP_ARTICLE_POLICY", "").strip().lower()
+        if not article_policy:
+            article_policy = "any" if profile is Profile.FULL else "internal_only"
+        if article_policy not in ("any", "internal_only"):
+            raise ValueError(
+                f"Unknown MCP_ARTICLE_POLICY: {article_policy!r} (valid: any, internal_only)"
+            )
 
         allowed_groups_str = os.getenv("MCP_ALLOWED_GROUPS", "")
         allowed_groups = None
@@ -280,6 +419,9 @@ class AccessController:
             default_permission=default_permission,
             category_permissions=category_permissions,
             denied_tools=denied_tools,
+            allowed_tools=allowed_tools,
+            profile=profile,
+            article_policy=article_policy,
             allowed_groups=allowed_groups,
             allowed_organizations=allowed_organizations,
             rate_limit_per_minute=rate_limit_per_minute,
@@ -294,6 +436,10 @@ class AccessController:
             if self.can_execute(tool_name):
                 allowed.append(tool_name)
         return sorted(allowed)
+
+    def get_blocked_tools(self) -> list[str]:
+        """Registered tools that cannot be executed under the current policy."""
+        return sorted(t for t in REGISTERED_TOOLS if not self.can_execute(t))
 
     def get_tool_info(self) -> list[dict[str, str]]:
         """Get detailed information about all registered tools and their permissions."""

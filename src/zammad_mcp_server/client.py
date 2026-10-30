@@ -9,6 +9,7 @@ import httpx
 import structlog
 from cachetools import TTLCache
 
+from zammad_mcp_server.identity import OboConfig, resolve_identity
 from zammad_mcp_server.models import (
     Article,
     ArticleCreateRequest,
@@ -24,6 +25,7 @@ from zammad_mcp_server.models import (
     User,
     UserCreateRequest,
 )
+from zammad_mcp_server.secrets_env import env_or_file
 
 logger = structlog.get_logger()
 
@@ -77,18 +79,19 @@ class ZammadClient:
         env_url = os.getenv("ZAMMAD_URL")
         resolved_url = url if url is not None else env_url
         self.url = (resolved_url or "").rstrip("/")
-        self.http_token = http_token or os.getenv("ZAMMAD_HTTP_TOKEN")
-        self.oauth2_token = oauth2_token or os.getenv("ZAMMAD_OAUTH2_TOKEN")
+        self.http_token = http_token or env_or_file("ZAMMAD_HTTP_TOKEN")
+        self.oauth2_token = oauth2_token or env_or_file("ZAMMAD_OAUTH2_TOKEN")
         self.username = username or os.getenv("ZAMMAD_USERNAME")
-        self.password = password or os.getenv("ZAMMAD_PASSWORD")
+        self.password = password or env_or_file("ZAMMAD_PASSWORD")
         self.timeout = timeout
+        self.obo = OboConfig.from_env()
 
         # Caches for static data
-        self._groups_cache: TTLCache[int, Group] = TTLCache(maxsize=max_cache_size, ttl=cache_ttl)
-        self._states_cache: TTLCache[str, list[dict[str, Any]]] = TTLCache(
+        self._groups_cache: TTLCache[Any, Group] = TTLCache(maxsize=max_cache_size, ttl=cache_ttl)
+        self._states_cache: TTLCache[Any, list[dict[str, Any]]] = TTLCache(
             maxsize=100, ttl=cache_ttl
         )
-        self._priorities_cache: TTLCache[str, list[dict[str, Any]]] = TTLCache(
+        self._priorities_cache: TTLCache[Any, list[dict[str, Any]]] = TTLCache(
             maxsize=100, ttl=cache_ttl
         )
 
@@ -102,7 +105,27 @@ class ZammadClient:
             "zammad_client_initialized",
             url=self.url,
             auth_method=self._get_auth_method(),
+            on_behalf_of=self.obo.source,
         )
+
+    def current_user(self) -> str | None:
+        """Caller identity for this request (None when on-behalf-of is off).
+
+        Raises IdentityError (a PermissionError) when on-behalf-of is enabled but the
+        request carries no valid identity.
+        """
+        return resolve_identity(self.obo)
+
+    def _ckey(self, key: Any) -> Any:
+        """Cache key. With on-behalf-of every user gets their own cache entries, because
+        what Zammad returns (visible groups etc.) depends on the impersonated user."""
+        user = self.current_user()
+        return key if user is None else (user, key)
+
+    def _identity_headers(self) -> dict[str, str]:
+        """Per-request headers. Resolved on every call, never cached on the shared client."""
+        user = self.current_user()
+        return {"X-On-Behalf-Of": user} if user else {}
 
     def _get_auth_method(self) -> str:
         """Determine the authentication method being used."""
@@ -151,6 +174,9 @@ class ZammadClient:
         url = f"/api/v1{path}"
 
         try:
+            identity_headers = self._identity_headers()
+            if identity_headers:
+                kwargs["headers"] = {**kwargs.get("headers", {}), **identity_headers}
             response = self._client.request(method, url, **kwargs)
             response.raise_for_status()
 
@@ -181,6 +207,9 @@ class ZammadClient:
             raise RuntimeError("Client not initialized")
         url = f"/api/v1{path}"
         try:
+            identity_headers = self._identity_headers()
+            if identity_headers:
+                kwargs["headers"] = {**kwargs.get("headers", {}), **identity_headers}
             response = self._client.request(method, url, **kwargs)
             response.raise_for_status()
             return response.content
@@ -631,13 +660,14 @@ class ZammadClient:
     def get_group(self, group_id: int) -> Group:
         """Get a group by ID."""
         # Check cache first
-        if group_id in self._groups_cache:
-            return self._groups_cache[group_id]
+        cache_key = self._ckey(group_id)
+        if cache_key in self._groups_cache:
+            return self._groups_cache[cache_key]
 
         result = self._request("GET", f"/groups/{group_id}", params={"expand": "true"})
         group = Group.model_validate(result)
 
-        self._groups_cache[group_id] = group
+        self._groups_cache[cache_key] = group
         return group
 
     def list_groups(self) -> list[Group]:
@@ -653,7 +683,7 @@ class ZammadClient:
 
         # Update cache
         for group in groups:
-            self._groups_cache[group.id] = group
+            self._groups_cache[self._ckey(group.id)] = group
 
         return groups
 
@@ -668,13 +698,14 @@ class ZammadClient:
 
         result = self._request("POST", "/groups", json=data)
         group = Group.model_validate(result)
-        self._groups_cache[group.id] = group
+        self._groups_cache[self._ckey(group.id)] = group
         return group
 
     def get_ticket_states(self) -> list[dict[str, Any]]:
         """Get all available ticket states."""
-        if "states" in self._states_cache:
-            return self._states_cache["states"]
+        states_key = self._ckey("states")
+        if states_key in self._states_cache:
+            return self._states_cache[states_key]
 
         result = self._request("GET", "/ticket_states", params={"expand": "true"})
 
@@ -685,13 +716,14 @@ class ZammadClient:
         else:
             states = []
 
-        self._states_cache["states"] = states
+        self._states_cache[states_key] = states
         return states
 
     def get_priorities(self) -> list[dict[str, Any]]:
         """Get all available priorities."""
-        if "priorities" in self._priorities_cache:
-            return self._priorities_cache["priorities"]
+        priorities_key = self._ckey("priorities")
+        if priorities_key in self._priorities_cache:
+            return self._priorities_cache[priorities_key]
 
         result = self._request("GET", "/ticket_priorities", params={"expand": "true"})
 
@@ -704,7 +736,7 @@ class ZammadClient:
         else:
             priorities = []
 
-        self._priorities_cache["priorities"] = priorities
+        self._priorities_cache[priorities_key] = priorities
         return priorities
 
     def list_ticket_tags(self, ticket_id: int) -> list[str]:

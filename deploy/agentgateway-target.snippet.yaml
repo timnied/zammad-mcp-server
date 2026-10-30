@@ -1,0 +1,21 @@
+# Add to the existing agentgateway config (mcp section). Same shape as the "everything" target.
+#
+# VERIFY BEFORE USE (written from the agentgateway 1.6.x docs, not run against your gateway):
+#   1. The CEL name of the Entra claim: jwt.preferred_username here; Entra v2 tokens also
+#      carry "upn"/"email" depending on the app registration. The value must equal the
+#      user's Zammad login or email.
+#   2. "add" appends. If the client also sends x-mcp-user, the server sees both values
+#      and REJECTS the request (fail closed), so a forged header never wins. Check that
+#      legitimate calls still work, i.e. that the gateway's value is the only one.
+#   3. The shared secret below must match secrets/mcp_proxy_secret.
+
+mcp:
+  policies:
+    transformations:
+      request:
+        add:
+          x-mcp-user: jwt.preferred_username
+          x-mcp-proxy-secret: '"<content of secrets/mcp_proxy_secret>"'
+  targets:
+  - name: zammad
+    host: http://zammad-mcp:8000/mcp

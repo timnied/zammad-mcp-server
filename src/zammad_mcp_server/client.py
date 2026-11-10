@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -28,6 +29,13 @@ from zammad_mcp_server.models import (
 from zammad_mcp_server.secrets_env import env_or_file
 
 logger = structlog.get_logger()
+
+
+def _zammad_time(value: datetime) -> str:
+    """Format a datetime the way Zammad expects timestamps (UTC, ISO 8601 with 'Z')."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 class ZammadClientError(Exception):
@@ -329,6 +337,8 @@ class ZammadClient:
             data["state"] = request.state.value
         if request.priority:
             data["priority"] = request.priority.value
+        if request.pending_time:
+            data["pending_time"] = _zammad_time(request.pending_time)
 
         # Include initial article if provided
         if request.article_body:
@@ -363,7 +373,7 @@ class ZammadClient:
         if request.priority:
             data["priority"] = request.priority.value
         if request.pending_time:
-            data["pending_time"] = request.pending_time.isoformat()
+            data["pending_time"] = _zammad_time(request.pending_time)
 
         result = self._request("PUT", f"/tickets/{ticket_id}", json=data)
         return Ticket.model_validate(result)

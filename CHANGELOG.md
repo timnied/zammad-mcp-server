@@ -10,6 +10,7 @@ Hardened gateway deployment (see `docs/GATEWAY_DEPLOYMENT.md`).
 - Zammad `X-On-Behalf-Of` per request (`MCP_OBO_SOURCE=header|jwt`), fail closed, per-user caches and rate limit, user in the audit log.
 - `*_FILE` variants for `ZAMMAD_HTTP_TOKEN`, `ZAMMAD_OAUTH2_TOKEN`, `ZAMMAD_PASSWORD`, `MCP_OBO_PROXY_SECRET`.
 - Audit log lines were silently dropped at the default log level; `MCP_LOG_LEVEL` (default `INFO`) now applies.
+- `create_ticket` and `update_ticket` accept `pending_time` (ISO 8601 with time zone, in the future). Required for the states `pending reminder` / `pending close` (Zammad answered 422 before). Unknown states and priorities now raise an error instead of being silently ignored.
 - Dockerfile: reproducible (`uv.lock`), non-root, path `/mcp`; `deploy/` has a compose file and a gateway snippet.
 
 - Dev stack defaults to Zammad **7.2.2** (`7.2.2-0024`): Memcached, scheduler, websocket, PostgreSQL 17, Redis 8, and Elasticsearch 9. Zammad 7.1 stays a supported tag.

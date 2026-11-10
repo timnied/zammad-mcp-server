@@ -8,6 +8,7 @@ import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -146,6 +147,79 @@ def _enforce_article_policy(article_type: str, internal: bool) -> tuple[str, boo
     if get_access_controller().policy.article_policy != "internal_only":
         return article_type, internal, False
     return "note", True, (article_type != "note" or not internal)
+
+
+PENDING_STATES = frozenset({TicketState.PENDING_REMINDER, TicketState.PENDING_CLOSE})
+
+
+def _parse_state(state: str | None) -> TicketState | None:
+    """Parse a state name. Unknown names fail loudly instead of being ignored."""
+    if not state:
+        return None
+    try:
+        return TicketState(state.strip().lower())
+    except ValueError:
+        valid = ", ".join(f"'{item.value}'" for item in TicketState)
+        raise ValueError(f"Unknown ticket state {state!r}. Valid states: {valid}.") from None
+
+
+def _parse_priority(priority: str | None) -> TicketPriority | None:
+    """Parse a priority name. Unknown names fail loudly instead of being ignored."""
+    if not priority:
+        return None
+    try:
+        return TicketPriority(priority.strip().lower())
+    except ValueError:
+        valid = ", ".join(f"'{item.value}'" for item in TicketPriority)
+        raise ValueError(
+            f"Unknown ticket priority {priority!r}. Valid priorities: {valid}."
+        ) from None
+
+
+def _parse_pending_time(raw: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp that carries a UTC offset and lies in the future."""
+    if not raw or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(
+            f"pending_time {raw!r} is not a valid ISO 8601 timestamp "
+            "(example: '2026-11-12T09:00:00+01:00' or '2026-11-12T08:00:00Z')."
+        ) from None
+    if value.tzinfo is None:
+        raise ValueError(
+            f"pending_time {raw!r} has no time zone. Add a UTC offset or 'Z', "
+            "e.g. '2026-11-12T09:00:00+01:00'."
+        )
+    if value <= datetime.now(UTC):
+        raise ValueError(f"pending_time {raw!r} is in the past. Use a future point in time.")
+    return value.astimezone(UTC)
+
+
+def _validate_pending(state: TicketState | None, pending_time: datetime | None) -> None:
+    """Zammad needs pending_time exactly for the pending states."""
+    if state in PENDING_STATES and pending_time is None:
+        raise ValueError(
+            f"State {state.value!r} requires pending_time (ISO 8601 with time zone, in the "
+            "future), e.g. '2026-11-12T09:00:00+01:00'."
+        )
+    if pending_time is not None and state is not None and state not in PENDING_STATES:
+        raise ValueError(
+            "pending_time can only be set together with the states "
+            f"'pending reminder' or 'pending close', not {state.value!r}."
+        )
+
+
+def _ticket_state_name(ticket: Any) -> str | None:
+    state = getattr(ticket, "state", None)
+    if state is None:
+        return None
+    name = getattr(state, "name", state)
+    return name.lower() if isinstance(name, str) else None
 
 
 def _parse_uploads(raw: list[dict[str, str]] | None) -> list[AttachmentUpload] | None:
@@ -318,8 +392,12 @@ def create_ticket(
     article_type: str = "note",
     article_internal: bool = False,
     attachments: list[dict[str, str]] | None = None,
+    pending_time: str | None = None,
 ) -> dict[str, Any]:
-    """Create a ticket. States: new, open, closed. Priorities: '1 low', '2 normal', '3 high'.
+    """Create a ticket. States: new, open, closed, pending reminder, pending close.
+
+    Priorities: '1 low', '2 normal', '3 high'. The pending states require pending_time
+    (ISO 8601 with time zone, in the future, e.g. '2026-11-12T09:00:00+01:00').
 
     Attachments are objects with filename, data (base64), and mime-type or mime_type.
     """
@@ -327,6 +405,11 @@ def create_ticket(
     get_access_controller().assert_group_allowed(group)
     client = get_client()
     article_type, article_internal, _ = _enforce_article_policy(article_type, article_internal)
+
+    state_enum = _parse_state(state)
+    priority_enum = _parse_priority(priority)
+    pending_dt = _parse_pending_time(pending_time)
+    _validate_pending(state_enum, pending_dt)
 
     try:
         article_type_enum = ArticleType(article_type)
@@ -337,8 +420,9 @@ def create_ticket(
         title=title,
         group=group,
         customer=customer,
-        state=state,  # type: ignore
-        priority=priority,  # type: ignore
+        state=state_enum,
+        priority=priority_enum,
+        pending_time=pending_dt,
         article_subject=article_subject,
         article_body=article_body,
         article_type=article_type_enum,
@@ -358,6 +442,7 @@ def update_ticket(
     owner: str | None = None,
     state: str | None = None,
     priority: str | None = None,
+    pending_time: str | None = None,
 ) -> dict[str, Any]:
     """Update an existing ticket.
 
@@ -366,8 +451,12 @@ def update_ticket(
         title: New title for the ticket
         group: New group to assign the ticket to
         owner: New owner (email or login)
-        state: New state (e.g., 'open', 'closed', 'pending reminder')
-        priority: New priority level
+        state: New state: 'new', 'open', 'closed', 'pending reminder' or 'pending close'
+        priority: New priority level ('1 low', '2 normal', '3 high')
+        pending_time: Required for 'pending reminder' / 'pending close': when the ticket
+            becomes due again, as ISO 8601 with time zone and in the future
+            (e.g. '2026-11-12T09:00:00+01:00'). May also be passed alone to reschedule a
+            ticket that is already pending.
 
     Returns:
         The updated ticket details.
@@ -379,19 +468,17 @@ def update_ticket(
     if group:
         get_access_controller().assert_group_allowed(group)
 
-    state_enum = None
-    if state:
-        try:
-            state_enum = TicketState(state)
-        except ValueError:
-            pass
-
-    priority_enum = None
-    if priority:
-        try:
-            priority_enum = TicketPriority(priority)
-        except ValueError:
-            pass
+    state_enum = _parse_state(state)
+    priority_enum = _parse_priority(priority)
+    pending_dt = _parse_pending_time(pending_time)
+    _validate_pending(state_enum, pending_dt)
+    if state_enum is None and pending_dt is not None:
+        current = _ticket_state_name(existing)
+        if current not in {item.value for item in PENDING_STATES}:
+            raise ValueError(
+                "pending_time can only be set for a ticket in a pending state; "
+                "also pass state='pending reminder' or 'pending close'."
+            )
 
     request = TicketUpdateRequest(
         title=title,
@@ -399,6 +486,7 @@ def update_ticket(
         owner=owner,
         state=state_enum,
         priority=priority_enum,
+        pending_time=pending_dt,
     )
 
     ticket = client.update_ticket(ticket_id, request)

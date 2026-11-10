@@ -80,6 +80,34 @@ def fake_zammad() -> Iterator[FakeZammad]:
                 return self._reply(401, {"error": "bad token"})
             if self.command == "GET" and path == "/api/v1/tickets/1":
                 return self._reply(200, create_ticket_data(1, group="Users", expand=True))
+            if self.command == "GET" and path == "/api/v1/tickets/2":
+                return self._reply(
+                    200, create_ticket_data(2, state="pending close", group="Users", expand=True)
+                )
+            if self.command in ("PUT", "POST") and path in (
+                "/api/v1/tickets/1",
+                "/api/v1/tickets/2",
+                "/api/v1/tickets",
+            ):
+                assert isinstance(body, dict)
+                # Mirror real Zammad: pending states need pending_time, others reject it.
+                if str(body.get("state", "")).startswith("pending") and not body.get(
+                    "pending_time"
+                ):
+                    return self._reply(
+                        422, {"error": "Missing required value for field 'pending_time'"}
+                    )
+                ticket_id = int(path.rsplit("/", 1)[-1]) if path != "/api/v1/tickets" else 50
+                return self._reply(
+                    200,
+                    create_ticket_data(
+                        ticket_id,
+                        state=body.get("state", "open"),
+                        group="Users",
+                        expand=True,
+                        pending_time=body.get("pending_time"),
+                    ),
+                )
             if self.command == "GET" and path == "/api/v1/users/me":
                 who = self.headers.get("X-On-Behalf-Of") or "service-account"
                 return self._reply(200, create_user_data(7, email="me@example.com", login=who))
@@ -463,3 +491,118 @@ async def test_duplicate_identity_header_is_rejected(
         resp = await http.post(helpdesk.url, headers=headers, json=call)
     assert "invalid format" in resp.text
     assert fake_zammad.api_calls() == []
+
+
+# ---- pending_time -----------------------------------------------------------------
+
+FUTURE = "2099-11-12T09:00:00+01:00"
+FUTURE_UTC = "2099-11-12T08:00:00.000Z"
+
+
+def _puts(fake: FakeZammad) -> list[Recorded]:
+    return [c for c in fake.api_calls() if c.method == "PUT"]
+
+
+async def test_pending_close_sends_pending_time_to_zammad(
+    helpdesk: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    async with helpdesk.client({"x-mcp-user": "alice@example.com"}) as client:
+        await client.call_tool(
+            "update_ticket",
+            {"ticket_id": 1, "state": "pending close", "pending_time": FUTURE},
+        )
+    (put,) = _puts(fake_zammad)
+    assert put.path == "/api/v1/tickets/1"
+    assert put.body == {"state": "pending close", "pending_time": FUTURE_UTC}
+
+
+async def test_pending_state_without_pending_time_is_rejected_before_zammad(
+    helpdesk: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    async with helpdesk.client({"x-mcp-user": "alice@example.com"}) as client:
+        with pytest.raises(ToolError, match="requires pending_time"):
+            await client.call_tool("update_ticket", {"ticket_id": 1, "state": "pending reminder"})
+    assert _puts(fake_zammad) == []
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({"state": "pending close", "pending_time": "2099-11-12T09:00:00"}, "no time zone"),
+        ({"state": "pending close", "pending_time": "morgen früh"}, "not a valid ISO 8601"),
+        ({"state": "pending close", "pending_time": "2001-01-01T00:00:00Z"}, "in the past"),
+        ({"state": "open", "pending_time": FUTURE}, "only be set together"),
+        ({"state": "banana"}, "Unknown ticket state"),
+        ({"priority": "urgent!"}, "Unknown ticket priority"),
+        ({"pending_time": FUTURE}, "pending state"),  # ticket 1 is 'open'
+    ],
+)
+async def test_invalid_pending_input_is_rejected_without_a_put(
+    helpdesk: McpEndpoint, fake_zammad: FakeZammad, args: dict[str, str], message: str
+) -> None:
+    async with helpdesk.client({"x-mcp-user": "alice@example.com"}) as client:
+        with pytest.raises(ToolError, match=message):
+            await client.call_tool("update_ticket", {"ticket_id": 1, **args})
+    assert _puts(fake_zammad) == []
+
+
+async def test_pending_time_alone_reschedules_an_already_pending_ticket(
+    helpdesk: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    async with helpdesk.client({"x-mcp-user": "alice@example.com"}) as client:
+        await client.call_tool("update_ticket", {"ticket_id": 2, "pending_time": FUTURE})
+    (put,) = _puts(fake_zammad)
+    assert put.path == "/api/v1/tickets/2"
+    assert put.body == {"pending_time": FUTURE_UTC}
+
+
+async def test_utc_z_suffix_is_accepted(helpdesk: McpEndpoint, fake_zammad: FakeZammad) -> None:
+    async with helpdesk.client({"x-mcp-user": "alice@example.com"}) as client:
+        await client.call_tool(
+            "update_ticket",
+            {"ticket_id": 1, "state": "pending reminder", "pending_time": "2099-11-12T08:00:00Z"},
+        )
+    assert _puts(fake_zammad)[0].body == {
+        "state": "pending reminder",
+        "pending_time": FUTURE_UTC,
+    }
+
+
+async def test_closing_a_ticket_still_works_without_pending_time(
+    helpdesk: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    async with helpdesk.client({"x-mcp-user": "alice@example.com"}) as client:
+        await client.call_tool("update_ticket", {"ticket_id": 1, "state": "closed"})
+    assert _puts(fake_zammad)[0].body == {"state": "closed"}
+
+
+async def test_create_ticket_supports_pending_time(
+    helpdesk: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    async with helpdesk.client({"x-mcp-user": "alice@example.com"}) as client:
+        await client.call_tool(
+            "create_ticket",
+            {
+                "title": "Warten auf Hardware",
+                "group": "Users",
+                "state": "pending reminder",
+                "pending_time": FUTURE,
+            },
+        )
+        with pytest.raises(ToolError, match="requires pending_time"):
+            await client.call_tool(
+                "create_ticket", {"title": "x", "group": "Users", "state": "pending close"}
+            )
+    posts = [
+        c for c in fake_zammad.api_calls() if c.method == "POST" and c.path.endswith("/tickets")
+    ]
+    assert len(posts) == 1
+    assert posts[0].body["state"] == "pending reminder"
+    assert posts[0].body["pending_time"] == FUTURE_UTC
+
+
+async def test_tool_schema_exposes_pending_time(helpdesk: McpEndpoint) -> None:
+    async with helpdesk.client({"x-mcp-user": "alice@example.com"}) as client:
+        tools = {t.name: t for t in await client.list_tools()}
+    for name in ("update_ticket", "create_ticket"):
+        assert "pending_time" in tools[name].inputSchema["properties"]

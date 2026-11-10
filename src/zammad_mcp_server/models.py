@@ -339,6 +339,7 @@ class TicketCreateRequest(BaseModel):
     customer: str | None = None
     state: TicketState | None = None
     priority: TicketPriority | None = None
+    pending_time: datetime | None = None
     article_subject: str | None = Field(None, max_length=500)
     article_body: str | None = None
     article_type: ArticleType = ArticleType.NOTE

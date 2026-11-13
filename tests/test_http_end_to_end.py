@@ -166,6 +166,10 @@ def _start_mcp(
         "MCP_OBO_HEADER",
         "MCP_OBO_PROXY_SECRET",
         "MCP_OBO_ALLOWED_DOMAINS",
+        "MCP_OUTBOUND_MAIL",
+        "MCP_MAIL_MAX_RECIPIENTS",
+        "MCP_MAIL_RATE_LIMIT_PER_MINUTE",
+        "MCP_ALLOWED_GROUPS",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in {**base, **env}.items():
@@ -606,3 +610,259 @@ async def test_tool_schema_exposes_pending_time(helpdesk: McpEndpoint) -> None:
         tools = {t.name: t for t in await client.list_tools()}
     for name in ("update_ticket", "create_ticket"):
         assert "pending_time" in tools[name].inputSchema["properties"]
+
+
+# ---- outbound mail tools ----------------------------------------------------------
+
+MAIL_TOOL_NAMES = {"send_ticket_mail", "create_ticket_with_mail"}
+DESTRUCTIVE_NAMES = {
+    "delete_ticket",
+    "delete_user",
+    "delete_organization",
+    "merge_tickets",
+    "create_user",
+    "update_user",
+    "create_organization",
+    "update_organization",
+    "create_group",
+}
+
+
+@pytest.fixture
+def mailer(monkeypatch: pytest.MonkeyPatch, fake_zammad: FakeZammad) -> Iterator[McpEndpoint]:
+    """Helpdesk profile with the outbound mail tools switched on."""
+    yield from _start_mcp(
+        monkeypatch,
+        fake_zammad,
+        {"MCP_OBO_SOURCE": "header", "MCP_OUTBOUND_MAIL": "on", "MCP_MAIL_MAX_RECIPIENTS": "4"},
+    )
+
+
+@pytest.fixture
+def limited_mailer(
+    monkeypatch: pytest.MonkeyPatch, fake_zammad: FakeZammad
+) -> Iterator[McpEndpoint]:
+    yield from _start_mcp(
+        monkeypatch,
+        fake_zammad,
+        {
+            "MCP_OBO_SOURCE": "header",
+            "MCP_OUTBOUND_MAIL": "on",
+            "MCP_MAIL_RATE_LIMIT_PER_MINUTE": "2",
+        },
+    )
+
+
+def _mail_posts(fake: FakeZammad) -> list[Recorded]:
+    return [c for c in fake.api_calls() if c.method == "POST"]
+
+
+ALICE = {"x-mcp-user": "alice@example.com"}
+
+
+async def test_mail_tools_are_off_by_default(
+    helpdesk: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    async with helpdesk.client(ALICE) as client:
+        names = {t.name for t in await client.list_tools()}
+        assert not (MAIL_TOOL_NAMES & names)
+        with pytest.raises(ToolError):
+            await client.call_tool(
+                "send_ticket_mail", {"ticket_id": 1, "to": "x@example.org", "body": "hi"}
+            )
+    assert fake_zammad.api_calls() == []
+
+
+async def test_mail_tools_listed_but_no_destructive_tool_exposed(mailer: McpEndpoint) -> None:
+    async with mailer.client(ALICE) as client:
+        names = {t.name for t in await client.list_tools()}
+    assert names >= MAIL_TOOL_NAMES
+    assert not (DESTRUCTIVE_NAMES & names)
+
+
+async def test_send_ticket_mail_posts_an_external_email_article(
+    mailer: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    async with mailer.client(ALICE) as client:
+        result = await client.call_tool(
+            "send_ticket_mail",
+            {
+                "ticket_id": 1,
+                "to": "Vendor@Example.org, other@example.net",
+                "cc": "boss@example.com, vendor@example.org",
+                "body": "Bitte um Rückmeldung.",
+            },
+        )
+    (post,) = _mail_posts(fake_zammad)
+    assert post.path == "/api/v1/ticket_articles"
+    assert post.headers["x-on-behalf-of"] == "alice@example.com"
+    assert post.body == {
+        "ticket_id": 1,
+        "subject": "Test Ticket",
+        "body": "Bitte um Rückmeldung.",
+        "type": "email",
+        "internal": False,
+        "to": "vendor@example.org, other@example.net",
+        "cc": "boss@example.com",
+        "sender": "Agent",
+        "content_type": "text/plain",
+    }
+    assert result.data["to"] == ["vendor@example.org", "other@example.net"]
+    assert "not confirmed" in result.data["note"]
+
+
+async def test_send_ticket_mail_uses_a_given_subject(
+    mailer: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    async with mailer.client(ALICE) as client:
+        await client.call_tool(
+            "send_ticket_mail",
+            {"ticket_id": 1, "to": "a@example.org", "body": "x", "subject": "Anfrage Lieferzeit"},
+        )
+    assert _mail_posts(fake_zammad)[0].body["subject"] == "Anfrage Lieferzeit"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"to": "a@example.org\r\nBcc: evil@example.org"},
+        {"to": "Name <a@example.org>"},
+        {"to": '"a b"@example.org'},
+        {"to": "a@example.org", "cc": "not-an-address"},
+        {"to": ""},
+        {"to": "a@example.org", "subject": "Hallo\nBcc: evil@example.org"},
+        {"to": "a@example.org", "body": "   "},
+        {"to": "a@example.org,b@example.org,c@example.org,d@example.org,e@example.org"},
+    ],
+)
+async def test_invalid_mail_is_rejected_before_zammad_is_called(
+    mailer: McpEndpoint, fake_zammad: FakeZammad, args: dict[str, str]
+) -> None:
+    payload = {"ticket_id": 1, "body": "text", **args}
+    async with mailer.client(ALICE) as client:
+        with pytest.raises(ToolError):
+            await client.call_tool("send_ticket_mail", payload)
+    assert fake_zammad.api_calls() == []
+
+
+async def test_mail_tool_schemas_have_no_bcc_and_no_attachments(mailer: McpEndpoint) -> None:
+    async with mailer.client(ALICE) as client:
+        tools = {t.name: t for t in await client.list_tools() if t.name in MAIL_TOOL_NAMES}
+    for tool in tools.values():
+        props = set(tool.inputSchema["properties"])
+        assert not ({"bcc", "attachments", "internal", "type", "sender"} & props)
+
+
+async def test_mail_for_a_ticket_outside_the_group_scope_is_denied(
+    monkeypatch: pytest.MonkeyPatch, fake_zammad: FakeZammad
+) -> None:
+    env = {"MCP_OBO_SOURCE": "header", "MCP_OUTBOUND_MAIL": "on", "MCP_ALLOWED_GROUPS": "Other"}
+    for endpoint in _start_mcp(monkeypatch, fake_zammad, env):
+        async with endpoint.client(ALICE) as client:
+            with pytest.raises(ToolError, match="Access denied"):
+                await client.call_tool(
+                    "send_ticket_mail", {"ticket_id": 1, "to": "a@example.org", "body": "x"}
+                )
+            with pytest.raises(ToolError, match="Access denied"):
+                await client.call_tool(
+                    "create_ticket_with_mail",
+                    {"title": "t", "group": "Users", "to": "a@example.org", "body": "x"},
+                )
+    assert _mail_posts(fake_zammad) == []
+
+
+async def test_create_article_stays_internal_even_with_mail_tools_on(
+    mailer: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    async with mailer.client(ALICE) as client:
+        await client.call_tool(
+            "create_article",
+            {
+                "ticket_id": 1,
+                "body": "x",
+                "type": "email",
+                "internal": False,
+                "to": "victim@example.org",
+            },
+        )
+    (post,) = _mail_posts(fake_zammad)
+    assert post.body["internal"] is True
+    assert post.body["type"] == "note"
+    assert "to" not in post.body
+
+
+async def test_mail_quota_is_per_user_and_only_counts_valid_requests(
+    limited_mailer: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    ok = {"ticket_id": 1, "to": "a@example.org", "body": "x"}
+    async with limited_mailer.client(ALICE) as alice:
+        for _ in range(5):  # rejected requests must not use up the budget
+            with pytest.raises(ToolError):
+                await alice.call_tool("send_ticket_mail", {**ok, "to": "kaputt"})
+        await alice.call_tool("send_ticket_mail", ok)
+        await alice.call_tool("send_ticket_mail", ok)
+        with pytest.raises(ToolError, match="Mail limit"):
+            await alice.call_tool("send_ticket_mail", ok)
+    async with limited_mailer.client({"x-mcp-user": "bob@example.com"}) as bob:
+        await bob.call_tool("send_ticket_mail", ok)  # own budget
+    assert len(_mail_posts(fake_zammad)) == 3
+
+
+async def test_create_ticket_with_mail_sends_the_first_article_as_email(
+    mailer: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    async with mailer.client(ALICE) as client:
+        result = await client.call_tool(
+            "create_ticket_with_mail",
+            {
+                "title": "Angebot anfragen",
+                "group": "Users",
+                "to": "sales@example.org",
+                "cc": "me@example.com",
+                "body": "Bitte senden Sie uns ein Angebot.",
+                "priority": "2 normal",
+            },
+        )
+    (post,) = _mail_posts(fake_zammad)
+    assert post.path == "/api/v1/tickets"
+    assert post.headers["x-on-behalf-of"] == "alice@example.com"
+    assert post.body == {
+        "title": "Angebot anfragen",
+        "group": "Users",
+        "customer": "sales@example.org",
+        "priority": "2 normal",
+        "article": {
+            "subject": "Angebot anfragen",
+            "body": "Bitte senden Sie uns ein Angebot.",
+            "type": "email",
+            "internal": False,
+            "to": "sales@example.org",
+            "cc": "me@example.com",
+            "sender": "Agent",
+            "content_type": "text/plain",
+        },
+    }
+    assert result.data["mail"]["to"] == ["sales@example.org"]
+
+
+async def test_create_ticket_with_mail_validates_state_customer_and_recipients(
+    mailer: McpEndpoint, fake_zammad: FakeZammad
+) -> None:
+    base = {"title": "t", "group": "Users", "to": "a@example.org", "body": "x"}
+    async with mailer.client(ALICE) as client:
+        for extra, match in [
+            ({"state": "pending close"}, "requires pending_time"),
+            ({"state": "banana"}, "Unknown ticket state"),
+            ({"customer": "a@example.org, b@example.org"}, "exactly one"),
+            ({"to": "a@example.org\r\nBcc: x@example.org"}, "Invalid address"),
+            ({"title": "   "}, "title"),
+        ]:
+            with pytest.raises(ToolError, match=match):
+                await client.call_tool("create_ticket_with_mail", {**base, **extra})
+        await client.call_tool(
+            "create_ticket_with_mail",
+            {**base, "state": "pending reminder", "pending_time": "2099-11-12T09:00:00+01:00"},
+        )
+    (post,) = _mail_posts(fake_zammad)
+    assert post.body["state"] == "pending reminder"
+    assert post.body["pending_time"] == "2099-11-12T08:00:00.000Z"

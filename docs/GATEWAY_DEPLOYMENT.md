@@ -22,12 +22,39 @@ Claude Desktop -> bridge -> nginx (TLS) -> agentgateway (validates Entra token, 
 | `MCP_ALLOWED_TOOLS` | unset | Explicit allow-list (names or `fnmatch` patterns). When set, everything else is denied. |
 | `MCP_DENIED_TOOLS` | unset | Extra deny list (names or patterns). Deny always wins. |
 | `MCP_ARTICLE_POLICY` | `internal_only` (`any` in profile `full`) | `internal_only` forces every article, including the first article of a new ticket, to be an internal note without recipients. |
+| `MCP_OUTBOUND_MAIL` | `off` | `on` exposes the two mail tools `send_ticket_mail` and `create_ticket_with_mail` (see below). Only affects profile `helpdesk`; `readonly` never has them, `full` always does. |
+| `MCP_MAIL_MAX_RECIPIENTS` | `10` | Maximum recipients (`to` plus `cc`) per mail. `0` disables the limit. |
+| `MCP_MAIL_RATE_LIMIT_PER_MINUTE` | `10` | Mails per minute and user (separate from the general call limit). `0` disables the limit. |
 | `MCP_DEFAULT_PERMISSION` | `write` | Existing permission level; profiles and lists are applied on top. |
 
 Blocked in `readonly` and `helpdesk`: `delete_ticket`, `delete_user`, `delete_organization`,
 `merge_tickets` (destructive) and `create_user`, `update_user`, `create_organization`,
 `update_organization`, `create_group` (change who exists in Zammad). Neither the allow-list
 nor `MCP_DEFAULT_PERMISSION=admin` re-enables them; use `MCP_PROFILE=full` for that.
+
+### Sending e-mail from tickets
+
+`create_article` and `create_ticket` stay internal-note-only (`MCP_ARTICLE_POLICY=internal_only`);
+the model cannot turn them into outbound mail through a parameter. E-mail goes out only
+through two dedicated tools, available when `MCP_OUTBOUND_MAIL=on`:
+
+- `send_ticket_mail(ticket_id, to, body, subject?, cc?)`: any mail from within an existing
+  ticket (reply or not). Subject defaults to the ticket title.
+- `create_ticket_with_mail(title, group, to, body, subject?, cc?, customer?, state?, priority?, pending_time?)`:
+  creates a ticket whose first article is the sent mail. The customer defaults to the first `to` address.
+
+Rules enforced by the server: recipients are arbitrary plain addresses (no domain list),
+validated strictly (no display names, line breaks, quotes); no BCC, no attachments, plain
+text only; at most `MCP_MAIL_MAX_RECIPIENTS` recipients; `MCP_MAIL_RATE_LIMIT_PER_MINUTE`
+mails per minute and user (only requests that passed validation count); group and
+ticket scope (`MCP_ALLOWED_GROUPS`) still apply; every mail is logged as `outbound_mail`
+with the acting user, recipients and ticket. Enabling mail does not unlock any destructive
+tool. Behind agentgateway the tool names carry the `zammad_` prefix; allow them only for
+the roles that may send mail. Zammad hands the mail to the group's mail channel, so
+delivery is not confirmed by the tool result.
+
+Zammad prerequisites: the group needs a sender address (outgoing mail channel), and the
+acting user needs agent rights on that group. Test with a ticket addressed to yourself first.
 
 Blocked tools are removed from `tools/list` (the model never sees them) **and** refused if
 called anyway. The old deny-list bug (denied tools still passed the write check) is fixed

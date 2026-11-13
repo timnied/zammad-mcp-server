@@ -46,6 +46,8 @@ TOOL_CATEGORIES: dict[str, ToolCategory] = {
     "delete_ticket": ToolCategory.TICKETS,
     "get_ticket_articles": ToolCategory.TICKETS,
     "create_article": ToolCategory.TICKETS,
+    "send_ticket_mail": ToolCategory.TICKETS,
+    "create_ticket_with_mail": ToolCategory.TICKETS,
     "get_ticket_stats": ToolCategory.TICKETS,
     "merge_tickets": ToolCategory.TICKETS,
     "link_tickets": ToolCategory.TICKETS,
@@ -120,6 +122,8 @@ TOOL_REQUIRED_PERMISSION: dict[str, Permission] = {
             "create_ticket",
             "update_ticket",
             "create_article",
+            "send_ticket_mail",
+            "create_ticket_with_mail",
             "link_tickets",
             "add_ticket_tag",
             "remove_ticket_tag",
@@ -141,6 +145,10 @@ TOOL_REQUIRED_PERMISSION: dict[str, Permission] = {
 DESTRUCTIVE_TOOLS: frozenset[str] = frozenset(
     {"delete_ticket", "delete_user", "delete_organization", "merge_tickets"}
 )
+
+# Tools that send e-mail to arbitrary external recipients. In the helpdesk profile they
+# are only available when MCP_OUTBOUND_MAIL=on; readonly never has them (they write).
+MAIL_TOOLS: frozenset[str] = frozenset({"send_ticket_mail", "create_ticket_with_mail"})
 
 # Operations that change who/what exists in Zammad (accounts, organizations, groups).
 # With an on-behalf-of service account these are the most sensitive writes, so the
@@ -198,6 +206,10 @@ class AccessPolicy:
     # "any": the model may choose article type/visibility. "internal_only": every
     # article created through the server is forced to be an internal note.
     article_policy: str = "any"
+    # Helpdesk profile only: expose the outbound mail tools (MAIL_TOOLS).
+    outbound_mail: bool = False
+    mail_max_recipients: int = 10
+    mail_rate_limit_per_minute: int = 10
     allowed_groups: set[str] | None = None
     allowed_organizations: set[int] | None = None
     rate_limit_per_minute: int = 60
@@ -220,6 +232,7 @@ class AccessController:
         self.policy = policy or AccessPolicy()
         self._access_log: list[dict[str, Any]] = []
         self._call_times: dict[str | None, list[float]] = {}
+        self._mail_times: dict[str | None, list[float]] = {}
 
     def can_execute(self, tool_name: str) -> bool:
         """Check if a tool can be executed."""
@@ -255,18 +268,39 @@ class AccessController:
         The window is kept per user when an on-behalf-of identity is known, so one
         busy user cannot exhaust the budget of everyone else.
         """
-        limit = self.policy.rate_limit_per_minute
+        self._consume(
+            self._call_times,
+            user,
+            self.policy.rate_limit_per_minute,
+            "Rate limit exceeded ({limit} calls/minute). Retry after a short wait.",
+        )
+
+    def consume_mail_quota(self, user: str | None = None) -> None:
+        """Count one outbound mail for ``user``; raise PermissionError over the limit.
+
+        Call this only after the request passed validation, so rejected requests do
+        not use up the budget.
+        """
+        self._consume(
+            self._mail_times,
+            user,
+            self.policy.mail_rate_limit_per_minute,
+            "Mail limit exceeded ({limit} mails/minute). Retry after a short wait.",
+        )
+
+    @staticmethod
+    def _consume(
+        store: dict[str | None, list[float]], user: str | None, limit: int, message: str
+    ) -> None:
         if limit <= 0:
             return
         now = time.time()
-        times = [stamp for stamp in self._call_times.get(user, []) if now - stamp < 60.0]
+        times = [stamp for stamp in store.get(user, []) if now - stamp < 60.0]
         if len(times) >= limit:
-            self._call_times[user] = times
-            raise PermissionError(
-                f"Rate limit exceeded ({limit} calls/minute). Retry after a short wait."
-            )
+            store[user] = times
+            raise PermissionError(message.format(limit=limit))
         times.append(now)
-        self._call_times[user] = times
+        store[user] = times
 
     def _is_denied(self, tool_name: str) -> bool:
         """True when the tool is blocked by deny list, allow-list or profile.
@@ -286,6 +320,8 @@ class AccessController:
         if tool_name not in TOOL_REQUIRED_PERMISSION:
             return True
         if tool_name in DESTRUCTIVE_TOOLS or tool_name in DIRECTORY_MUTATION_TOOLS:
+            return True
+        if tool_name in MAIL_TOOLS and not self.policy.outbound_mail:
             return True
         if profile is Profile.READONLY:
             return TOOL_REQUIRED_PERMISSION[tool_name] is not Permission.READ_ONLY
@@ -398,6 +434,12 @@ class AccessController:
                 f"Unknown MCP_ARTICLE_POLICY: {article_policy!r} (valid: any, internal_only)"
             )
 
+        outbound_raw = os.getenv("MCP_OUTBOUND_MAIL", "off").strip().lower() or "off"
+        if outbound_raw not in ("on", "off"):
+            raise ValueError(f"Unknown MCP_OUTBOUND_MAIL: {outbound_raw!r} (valid: on, off)")
+        mail_max_recipients = int(os.getenv("MCP_MAIL_MAX_RECIPIENTS", "10"))
+        mail_rate_limit = int(os.getenv("MCP_MAIL_RATE_LIMIT_PER_MINUTE", "10"))
+
         allowed_groups_str = os.getenv("MCP_ALLOWED_GROUPS", "")
         allowed_groups = None
         if allowed_groups_str:
@@ -422,6 +464,9 @@ class AccessController:
             allowed_tools=allowed_tools,
             profile=profile,
             article_policy=article_policy,
+            outbound_mail=outbound_raw == "on",
+            mail_max_recipients=mail_max_recipients,
+            mail_rate_limit_per_minute=mail_rate_limit,
             allowed_groups=allowed_groups,
             allowed_organizations=allowed_organizations,
             rate_limit_per_minute=rate_limit_per_minute,

@@ -344,6 +344,8 @@ class TicketCreateRequest(BaseModel):
     article_body: str | None = None
     article_type: ArticleType = ArticleType.NOTE
     article_internal: bool = False
+    article_to: str | None = None
+    article_cc: str | None = None
     attachments: list[AttachmentUpload] | None = None
 
 
@@ -372,6 +374,8 @@ class ArticleCreateRequest(BaseModel):
     internal: bool = False
     to: str | None = None
     cc: str | None = None
+    sender: str | None = None
+    content_type: str | None = None
     attachments: list[AttachmentUpload] | None = None
 
 

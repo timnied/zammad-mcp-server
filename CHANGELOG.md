@@ -10,6 +10,7 @@ Hardened gateway deployment (see `docs/GATEWAY_DEPLOYMENT.md`).
 - Zammad `X-On-Behalf-Of` per request (`MCP_OBO_SOURCE=header|jwt`), fail closed, per-user caches and rate limit, user in the audit log.
 - `*_FILE` variants for `ZAMMAD_HTTP_TOKEN`, `ZAMMAD_OAUTH2_TOKEN`, `ZAMMAD_PASSWORD`, `MCP_OBO_PROXY_SECRET`.
 - Audit log lines were silently dropped at the default log level; `MCP_LOG_LEVEL` (default `INFO`) now applies.
+- New tools `send_ticket_mail` and `create_ticket_with_mail` send e-mail from a ticket or with a new ticket, to arbitrary plain addresses. Off by default (`MCP_OUTBOUND_MAIL=on` in profile `helpdesk`); no BCC or attachments, `MCP_MAIL_MAX_RECIPIENTS` (10) and `MCP_MAIL_RATE_LIMIT_PER_MINUTE` (10 per user), audit log entry `outbound_mail`. `create_article`/`create_ticket` remain internal-only.
 - `create_ticket` and `update_ticket` accept `pending_time` (ISO 8601 with time zone, in the future). Required for the states `pending reminder` / `pending close` (Zammad answered 422 before). Unknown states and priorities now raise an error instead of being silently ignored.
 - Dockerfile: reproducible (`uv.lock`), non-root, path `/mcp`; `deploy/` has a compose file and a gateway snippet.
 

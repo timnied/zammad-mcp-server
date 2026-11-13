@@ -11,6 +11,7 @@ import pytest
 from zammad_mcp_server.access_control import (
     DESTRUCTIVE_TOOLS,
     DIRECTORY_MUTATION_TOOLS,
+    MAIL_TOOLS,
     REGISTERED_TOOLS,
     TOOL_REQUIRED_PERMISSION,
     AccessController,
@@ -31,6 +32,9 @@ def _controller(monkeypatch: pytest.MonkeyPatch, **env: str) -> AccessController
         "MCP_DEFAULT_PERMISSION",
         "MCP_ARTICLE_POLICY",
         "MCP_ALLOWED_CATEGORIES",
+        "MCP_OUTBOUND_MAIL",
+        "MCP_MAIL_MAX_RECIPIENTS",
+        "MCP_MAIL_RATE_LIMIT_PER_MINUTE",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
@@ -179,7 +183,7 @@ def test_allow_list_cannot_enable_destructive_tools_in_helpdesk(
 def test_blocked_tools_listing(monkeypatch: pytest.MonkeyPatch) -> None:
     c = _controller(monkeypatch)
     blocked = set(c.get_blocked_tools())
-    assert blocked == DESTRUCTIVE_TOOLS | DIRECTORY_MUTATION_TOOLS
+    assert blocked == DESTRUCTIVE_TOOLS | DIRECTORY_MUTATION_TOOLS | MAIL_TOOLS
     assert set(c.get_allowed_tools()) == set(REGISTERED_TOOLS) - blocked
 
 
@@ -200,3 +204,61 @@ def test_rate_limit_is_per_user() -> None:
     with pytest.raises(PermissionError, match="Rate limit"):
         c.consume_rate_limit("alice@example.com")
     c.consume_rate_limit("bob@example.com")  # bob has his own budget
+
+
+# ---- outbound mail switch ---------------------------------------------------------
+
+
+def test_mail_tools_are_registered_write_tools() -> None:
+    assert set(REGISTERED_TOOLS) >= MAIL_TOOLS
+    for tool in MAIL_TOOLS:
+        assert TOOL_REQUIRED_PERMISSION[tool] is Permission.WRITE
+
+
+def test_mail_tools_are_blocked_by_default_and_enabled_by_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    off = _controller(monkeypatch)
+    assert all(not off.can_execute(t) for t in MAIL_TOOLS)
+    on = _controller(monkeypatch, MCP_OUTBOUND_MAIL="on")
+    assert all(on.can_write(t) for t in MAIL_TOOLS)
+    # enabling mail unlocks nothing destructive
+    for tool in DESTRUCTIVE_TOOLS | DIRECTORY_MUTATION_TOOLS:
+        assert not on.can_execute(tool), tool
+    assert set(on.get_blocked_tools()) == DESTRUCTIVE_TOOLS | DIRECTORY_MUTATION_TOOLS
+
+
+def test_readonly_profile_never_has_mail_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    c = _controller(monkeypatch, MCP_PROFILE="readonly", MCP_OUTBOUND_MAIL="on")
+    assert all(not c.can_execute(t) for t in MAIL_TOOLS)
+
+
+def test_mail_tools_respect_deny_and_allow_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+    c = _controller(monkeypatch, MCP_OUTBOUND_MAIL="on", MCP_DENIED_TOOLS="create_ticket_with_mail")
+    assert c.can_write("send_ticket_mail")
+    assert not c.can_execute("create_ticket_with_mail")
+    c = _controller(monkeypatch, MCP_OUTBOUND_MAIL="on", MCP_ALLOWED_TOOLS="get_ticket")
+    assert not c.can_execute("send_ticket_mail")
+
+
+def test_invalid_outbound_mail_value_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValueError, match="MCP_OUTBOUND_MAIL"):
+        _controller(monkeypatch, MCP_OUTBOUND_MAIL="maybe")
+
+
+def test_mail_defaults_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    c = _controller(monkeypatch)
+    assert c.policy.mail_max_recipients == 10
+    assert c.policy.mail_rate_limit_per_minute == 10
+    c = _controller(monkeypatch, MCP_MAIL_MAX_RECIPIENTS="3", MCP_MAIL_RATE_LIMIT_PER_MINUTE="1")
+    assert (c.policy.mail_max_recipients, c.policy.mail_rate_limit_per_minute) == (3, 1)
+
+
+def test_mail_quota_is_per_user_and_separate_from_the_call_rate_limit() -> None:
+    c = AccessController(AccessPolicy(rate_limit_per_minute=1, mail_rate_limit_per_minute=2))
+    c.consume_mail_quota("alice@example.com")
+    c.consume_mail_quota("alice@example.com")
+    with pytest.raises(PermissionError, match="Mail limit"):
+        c.consume_mail_quota("alice@example.com")
+    c.consume_mail_quota("bob@example.com")
+    c.consume_rate_limit("alice@example.com")  # general call budget is untouched

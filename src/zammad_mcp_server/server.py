@@ -19,6 +19,7 @@ from zammad_mcp_server.cli import parse_server_args, run_server
 from zammad_mcp_server.client import NotFoundError, ZammadClient
 from zammad_mcp_server.formatting import html_to_text, with_body_plain
 from zammad_mcp_server.identity import OboConfig, resolve_identity
+from zammad_mcp_server.mail import clean_body, clean_subject, parse_addresses, prepare_recipients
 from zammad_mcp_server.models import (
     ArticleCreateRequest,
     ArticleType,
@@ -584,6 +585,159 @@ def create_article(
     result = with_body_plain(article.model_dump())
     if coerced:
         result["policy_note"] = INTERNAL_NOTE_MESSAGE
+    return result
+
+
+MAIL_DELIVERY_NOTE = (
+    "The mail was handed to Zammad for delivery through the group's mail channel. "
+    "Delivery to the recipient is not confirmed here."
+)
+
+
+def _log_outbound_mail(
+    tool: str, ticket_id: int | None, to: list[str], cc: list[str], subject: str
+) -> None:
+    logger.info(
+        "outbound_mail",
+        tool=tool,
+        user=_current_user(),
+        ticket_id=ticket_id,
+        to=to,
+        cc=cc,
+        subject=subject[:120],
+    )
+
+
+@mcp.tool()
+def send_ticket_mail(
+    ticket_id: int,
+    to: str,
+    body: str,
+    subject: str | None = None,
+    cc: str | None = None,
+) -> dict[str, Any]:
+    """Send an e-mail from within an existing ticket (reply or any other mail).
+
+    The mail is sent through the ticket's group mail channel and appears as an e-mail
+    article in the ticket. Recipients are plain addresses, comma separated ('to', 'cc');
+    there is no BCC and no attachment support. Plain-text body. The subject defaults
+    to the ticket title. The server limits recipients and mails per minute and logs
+    every mail with the acting user. The mail goes out to external recipients.
+
+    Args:
+        ticket_id: Internal ticket ID (not the ticket number)
+        to: Recipient address(es), e.g. 'a@example.com, b@example.com'
+        body: Plain-text message
+        subject: Subject (default: ticket title)
+        cc: Optional CC address(es)
+    """
+    check_access("send_ticket_mail", Permission.WRITE)
+    controller = get_access_controller()
+    to_list, cc_list = prepare_recipients(to, cc, controller.policy.mail_max_recipients)
+    body = clean_body(body)
+    subject_clean = clean_subject(subject, "x") if subject and subject.strip() else None
+    client = get_client()
+    ticket = client.get_ticket(ticket_id)
+    _assert_ticket_in_scope(ticket)
+    if subject_clean is None:
+        subject_clean = clean_subject(None, str(getattr(ticket, "title", "")))
+
+    controller.consume_mail_quota(_current_user())
+    article = client.create_article(
+        ArticleCreateRequest(
+            ticket_id=ticket_id,
+            subject=subject_clean,
+            body=body,
+            type=ArticleType.EMAIL,
+            internal=False,
+            to=", ".join(to_list),
+            cc=", ".join(cc_list) or None,
+            sender="Agent",
+            content_type="text/plain",
+        )
+    )
+    _log_outbound_mail("send_ticket_mail", ticket_id, to_list, cc_list, subject_clean)
+    return {
+        "ticket_id": ticket_id,
+        "article_id": article.id,
+        "to": to_list,
+        "cc": cc_list,
+        "subject": subject_clean,
+        "note": MAIL_DELIVERY_NOTE,
+    }
+
+
+@mcp.tool()
+def create_ticket_with_mail(
+    title: str,
+    group: str,
+    to: str,
+    body: str,
+    subject: str | None = None,
+    cc: str | None = None,
+    customer: str | None = None,
+    state: str | None = None,
+    priority: str | None = None,
+    pending_time: str | None = None,
+) -> dict[str, Any]:
+    """Create a ticket and send an e-mail with it (the first article is the sent mail).
+
+    Recipients are plain addresses, comma separated ('to', 'cc'); no BCC, no
+    attachments, plain-text body. The customer defaults to the first 'to' address. The
+    server limits recipients and mails per minute and logs every mail with the acting
+    user. The mail goes out to external recipients.
+
+    Args:
+        title: Ticket title
+        group: Group name (its mail channel is used for sending)
+        to: Recipient address(es)
+        body: Plain-text message
+        subject: Mail subject (default: ticket title)
+        cc: Optional CC address(es)
+        customer: Customer e-mail address (default: first 'to' address)
+        state: 'new', 'open', 'closed', 'pending reminder' or 'pending close'
+        priority: '1 low', '2 normal' or '3 high'
+        pending_time: Required for the pending states (ISO 8601 with time zone)
+    """
+    check_access("create_ticket_with_mail", Permission.WRITE)
+    controller = get_access_controller()
+    controller.assert_group_allowed(group)
+    to_list, cc_list = prepare_recipients(to, cc, controller.policy.mail_max_recipients)
+    body = clean_body(body)
+    title = title.strip()
+    if not title:
+        raise ValueError("The ticket title must not be empty.")
+    subject_clean = clean_subject(subject, title)
+    customer_list = parse_addresses(customer, "customer") if customer else [to_list[0]]
+    if len(customer_list) != 1:
+        raise ValueError("'customer' must be exactly one e-mail address.")
+    state_enum = _parse_state(state)
+    priority_enum = _parse_priority(priority)
+    pending_dt = _parse_pending_time(pending_time)
+    _validate_pending(state_enum, pending_dt)
+    client = get_client()
+
+    controller.consume_mail_quota(_current_user())
+    ticket = client.create_ticket(
+        TicketCreateRequest(
+            title=title,
+            group=group,
+            customer=customer_list[0],
+            state=state_enum,
+            priority=priority_enum,
+            pending_time=pending_dt,
+            article_subject=subject_clean,
+            article_body=body,
+            article_type=ArticleType.EMAIL,
+            article_internal=False,
+            article_to=", ".join(to_list),
+            article_cc=", ".join(cc_list) or None,
+        )
+    )
+    _log_outbound_mail("create_ticket_with_mail", ticket.id, to_list, cc_list, subject_clean)
+    result = ticket.model_dump()
+    result["mail"] = {"to": to_list, "cc": cc_list, "subject": subject_clean}
+    result["note"] = MAIL_DELIVERY_NOTE
     return result
 
 

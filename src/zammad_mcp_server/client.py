@@ -348,6 +348,12 @@ class ZammadClient:
                 "type": request.article_type.value,
                 "internal": request.article_internal,
             }
+            if request.article_to:
+                data["article"]["to"] = request.article_to
+                data["article"]["sender"] = "Agent"
+                data["article"]["content_type"] = "text/plain"
+                if request.article_cc:
+                    data["article"]["cc"] = request.article_cc
             if request.attachments:
                 data["article"]["attachments"] = [item.to_zammad() for item in request.attachments]
 
@@ -409,6 +415,10 @@ class ZammadClient:
             data["to"] = request.to
         if request.cc:
             data["cc"] = request.cc
+        if request.sender:
+            data["sender"] = request.sender
+        if request.content_type:
+            data["content_type"] = request.content_type
         if request.attachments:
             data["attachments"] = [item.to_zammad() for item in request.attachments]
 

@@ -35,6 +35,9 @@ services:
       # --- What the model may do ---
       MCP_PROFILE: helpdesk                  # readonly | helpdesk | full
       MCP_ARTICLE_POLICY: internal_only      # every article becomes an internal note
+      MCP_OUTBOUND_MAIL: "off"               # "on" exposes send_ticket_mail / create_ticket_with_mail
+      # MCP_MAIL_MAX_RECIPIENTS: "10"        # to + cc per mail
+      # MCP_MAIL_RATE_LIMIT_PER_MINUTE: "10" # mails per minute and user
       MCP_DENIED_TOOLS: ""                   # optional extra names/patterns, e.g. "link_tickets"
       MCP_RATE_LIMIT_PER_MINUTE: "60"        # per user
 

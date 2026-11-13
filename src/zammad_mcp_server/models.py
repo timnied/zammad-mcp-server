@@ -40,6 +40,13 @@ class ArticleType(str, Enum):
     FACEBOOK = "facebook"
 
 
+class ArticleContentType(str, Enum):
+    """Body formats Zammad stores on an article."""
+
+    PLAIN = "text/plain"
+    HTML = "text/html"
+
+
 class Visibility(str, Enum):
     """Article visibility."""
 
@@ -146,6 +153,7 @@ class Article(BaseModel):
     sender: str | None = None
     subject: str | None = None
     body: str | None = None
+    content_type: str | None = None
     from_address: str | None = Field(alias="from", default=None)
     to: str | None = None
     cc: str | None = None
@@ -346,6 +354,7 @@ class TicketCreateRequest(BaseModel):
     article_internal: bool = False
     article_to: str | None = None
     article_cc: str | None = None
+    article_content_type: ArticleContentType | None = None
     attachments: list[AttachmentUpload] | None = None
 
 
@@ -375,7 +384,7 @@ class ArticleCreateRequest(BaseModel):
     to: str | None = None
     cc: str | None = None
     sender: str | None = None
-    content_type: str | None = None
+    content_type: ArticleContentType | None = None
     attachments: list[AttachmentUpload] | None = None
 
 

@@ -204,11 +204,15 @@ Supports three authentication methods with precedence:
    ZAMMAD_HTTP_TOKEN=your-token
    ```
 
-2. **OAuth2 Token**
+2. **OAuth2 bearer token**
+
+   Register callback `http://127.0.0.1:8765/callback` on a Zammad OAuth application, then run `zammad-mcp-server login --url https://your-zammad.example --client-id YOUR_CLIENT_ID`. The command prints:
 
    ```bash
    ZAMMAD_OAUTH2_TOKEN=your-oauth-token
    ```
+
+   A bearer token you already have can be placed in that variable directly. It is sent as `Authorization: Bearer`.
 
 3. **Username/Password**
    ```bash

@@ -47,3 +47,20 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Make the GHCR package public
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          owner="${GITHUB_REPOSITORY%%/*}"
+          name="${GITHUB_REPOSITORY#*/}"
+          name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+          gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/orgs/${owner}/packages/container/${name}" \
+            -f visibility=public \
+            || gh api --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "/users/${owner}/packages/container/${name}" \
+              -f visibility=public

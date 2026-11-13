@@ -40,6 +40,46 @@ def test_create_article_sends_mime_type_key(respx_mock: respx.MockRouter) -> Non
     assert b"mime-type" in sent.content
 
 
+def test_create_article_sends_content_type_when_set(respx_mock: respx.MockRouter) -> None:
+    route = respx_mock.post("http://test-zammad.local/api/v1/ticket_articles").mock(
+        return_value=Response(
+            201,
+            json={"id": 10, "ticket_id": 1, "body": "<b>Hello</b>", "content_type": "text/html"},
+        )
+    )
+    client = ZammadClient()
+    article = client.create_article(
+        ArticleCreateRequest(
+            ticket_id=1,
+            body="<b>Hello</b>",
+            type=ArticleType.NOTE,
+            content_type="text/html",
+        )
+    )
+    assert article.content_type == "text/html"
+    assert b'"content_type":"text/html"' in route.calls.last.request.content.replace(b" ", b"")
+
+
+def test_create_article_omits_content_type_when_unset(respx_mock: respx.MockRouter) -> None:
+    route = respx_mock.post("http://test-zammad.local/api/v1/ticket_articles").mock(
+        return_value=Response(201, json={"id": 11, "ticket_id": 1, "body": "plain"})
+    )
+    ZammadClient().create_article(ArticleCreateRequest(ticket_id=1, body="plain"))
+    assert b"content_type" not in route.calls.last.request.content
+
+
+def test_get_ticket_articles_parses_zammad_list(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get("http://test-zammad.local/api/v1/ticket_articles/by_ticket/165044").mock(
+        return_value=Response(
+            200,
+            json=[{"id": 1, "ticket_id": 165044, "body": "Hi", "content_type": "text/plain"}],
+        )
+    )
+    articles = ZammadClient().get_ticket_articles(165044)
+    assert articles[0].ticket_id == 165044
+    assert articles[0].content_type == "text/plain"
+
+
 def test_get_article_attachment_bytes(respx_mock: respx.MockRouter) -> None:
     respx_mock.get("http://test-zammad.local/api/v1/ticket_attachment/1/2/3").mock(
         return_value=Response(200, content=b"hello")

@@ -507,10 +507,17 @@ fly open
 
 ### Authentication Alternatives
 
-Instead of `ZAMMAD_HTTP_TOKEN`, you can use:
+Personal access tokens (`ZAMMAD_HTTP_TOKEN`) are the normal setup. See [Zammad API authentication](https://docs.zammad.org/en/latest/api/intro.html).
+
+To use a Zammad OAuth application instead, register the callback `http://127.0.0.1:8765/callback`, then:
+
+```bash
+zammad-mcp-server login --url https://your-zammad.com --client-id YOUR_CLIENT_ID
+```
+
+Put the printed bearer token in the environment:
 
 ```env
-# OAuth2
 ZAMMAD_OAUTH2_TOKEN=oauth_token_here
 
 # Or basic auth
@@ -639,7 +646,7 @@ The published image listens on **Streamable HTTP** (`/mcp/` on port 8000). There
 ```bash
 # Test Zammad connection
 curl -H "Authorization: Token token=$ZAMMAD_HTTP_TOKEN" \
-  "$ZAMMAD_URL/api/v1/ping"
+  "$ZAMMAD_URL/api/v1/users/me"
 
 # Check logs
 docker logs <container_id>

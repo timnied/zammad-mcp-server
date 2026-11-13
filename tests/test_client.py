@@ -87,7 +87,13 @@ class TestZammadClientRequests:
         result = client.health_check()
 
         assert result["status"] == "healthy"
-        assert "response" in result
+        assert result["user_id"] == 1
+
+    def test_get_server_info_reads_version(self, zammad_api_mock: Any) -> None:
+        client = ZammadClient()
+        info = client.get_server_info()
+        assert info["version"] == "7.2.2"
+        assert info["user_id"] == 1
 
     def test_get_ticket(self, zammad_api_mock: Any) -> None:
         """Test getting a ticket."""
@@ -343,7 +349,7 @@ class TestZammadClientErrors:
 
     def test_network_error(self, respx_mock: respx.MockRouter) -> None:
         """Test handling of network errors."""
-        respx_mock.get("http://test-zammad.local/api/v1/ping").mock(
+        respx_mock.get("http://test-zammad.local/api/v1/users/me").mock(
             side_effect=httpx.ConnectError("Connection failed")
         )
 

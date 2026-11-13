@@ -21,7 +21,7 @@ x-zammad-service: &zammad-service
     ELASTICSEARCH_REINDEX: "true"
     NGINX_PORT: "8080"
     ZAMMAD_FQDN: localhost
-  restart: "no"
+  restart: unless-stopped
   networks:
     - zammad-network
 
@@ -29,6 +29,7 @@ services:
   zammad-postgresql:
     image: postgres:17.11-alpine
     container_name: zammad-postgresql
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: zammad
@@ -59,6 +60,7 @@ services:
   zammad-redis:
     image: redis:8.10.3-alpine
     container_name: zammad-redis
+    restart: unless-stopped
     volumes:
       - zammad-redis-data:/data
     healthcheck:
@@ -73,6 +75,7 @@ services:
   zammad-memcached:
     image: memcached:1.6.45-alpine
     container_name: zammad-memcached
+    restart: unless-stopped
     command: memcached -m 256M
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "11211"]
@@ -86,6 +89,7 @@ services:
   zammad-elasticsearch:
     image: elasticsearch:9.5.5
     container_name: zammad-elasticsearch
+    restart: unless-stopped
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"

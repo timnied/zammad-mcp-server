@@ -149,10 +149,22 @@ class TestArticleModel:
         assert article.subject == "Test Article"
         assert article.internal is False
 
-    def test_article_internal_default(self) -> None:
-        """Test that internal defaults to False."""
-        article = Article(id=1, ticket_id=100)
-        assert article.internal is False
+    def test_article_accepts_zammad_snake_case_payload(self) -> None:
+        """Zammad returns ticket_id, not ticketId. Parsing that used to fail the tool call."""
+        article = Article.model_validate(
+            {
+                "id": 9,
+                "ticket_id": 165044,
+                "body": "Hello",
+                "content_type": "text/html",
+                "internal": False,
+                "created_by": "agent@example.com",
+                "created_at": "2026-10-26T12:00:00Z",
+            }
+        )
+        assert article.ticket_id == 165044
+        assert article.content_type == "text/html"
+        assert article.created_by == "agent@example.com"
 
 
 class TestOrganizationModel:

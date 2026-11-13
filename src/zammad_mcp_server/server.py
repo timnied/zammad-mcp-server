@@ -15,12 +15,13 @@ import structlog
 from fastmcp import FastMCP
 
 from zammad_mcp_server.access_control import REGISTERED_TOOLS, AccessController, Permission
-from zammad_mcp_server.cli import parse_server_args, run_server
+from zammad_mcp_server.cli import parse_server_args, run_oauth_login_cli, run_server
 from zammad_mcp_server.client import NotFoundError, ZammadClient
 from zammad_mcp_server.formatting import html_to_text, with_body_plain
 from zammad_mcp_server.identity import OboConfig, resolve_identity
 from zammad_mcp_server.mail import clean_body, clean_subject, parse_addresses, prepare_recipients
 from zammad_mcp_server.models import (
+    ArticleContentType,
     ArticleCreateRequest,
     ArticleType,
     AttachmentUpload,
@@ -229,6 +230,16 @@ def _parse_uploads(raw: list[dict[str, str]] | None) -> list[AttachmentUpload] |
     return [AttachmentUpload.model_validate(item) for item in raw]
 
 
+def _parse_content_type(value: str | None) -> ArticleContentType | None:
+    """Accept Zammad article body formats. None means omit the field."""
+    if value is None:
+        return None
+    try:
+        return ArticleContentType(value)
+    except ValueError as exc:
+        raise ValueError("content_type must be text/plain or text/html") from exc
+
+
 def _ticket_dict(ticket: Any) -> dict[str, Any]:
     dumped = ticket.model_dump()
     if isinstance(dumped, dict):
@@ -392,6 +403,7 @@ def create_ticket(
     article_body: str | None = None,
     article_type: str = "note",
     article_internal: bool = False,
+    article_content_type: str | None = None,
     attachments: list[dict[str, str]] | None = None,
     pending_time: str | None = None,
 ) -> dict[str, Any]:
@@ -400,6 +412,7 @@ def create_ticket(
     Priorities: '1 low', '2 normal', '3 high'. The pending states require pending_time
     (ISO 8601 with time zone, in the future, e.g. '2026-11-12T09:00:00+01:00').
 
+    article_content_type is text/plain or text/html. Omit it and Zammad stores text/plain.
     Attachments are objects with filename, data (base64), and mime-type or mime_type.
     """
     check_access("create_ticket", Permission.WRITE)
@@ -417,6 +430,11 @@ def create_ticket(
     except ValueError:
         article_type_enum = ArticleType.NOTE
 
+    try:
+        article_content_type_value = _parse_content_type(article_content_type)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     request = TicketCreateRequest(
         title=title,
         group=group,
@@ -428,6 +446,7 @@ def create_ticket(
         article_body=article_body,
         article_type=article_type_enum,
         article_internal=article_internal,
+        article_content_type=article_content_type_value,
         attachments=_parse_uploads(attachments),
     )
 
@@ -549,11 +568,13 @@ def create_article(
     internal: bool = False,
     to: str | None = None,
     cc: str | None = None,
+    content_type: str | None = None,
     attachments: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Add an article (default: note) to a ticket. internal=True keeps it staff-only.
 
-    Server policy may force every article to be an internal note. Attachments:
+    Server policy may force every article to be an internal note. content_type is
+    text/plain or text/html (omit it and Zammad stores text/plain). Attachments:
     filename, data (base64), mime-type.
     """
     check_access("create_article", Permission.WRITE)
@@ -570,6 +591,11 @@ def create_article(
     except ValueError:
         article_type_enum = ArticleType.NOTE
 
+    try:
+        content_type_value = _parse_content_type(content_type)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     request = ArticleCreateRequest(
         ticket_id=ticket_id,
         body=body,
@@ -578,6 +604,7 @@ def create_article(
         internal=internal,
         to=to,
         cc=cc,
+        content_type=content_type_value,
         attachments=_parse_uploads(attachments),
     )
 
@@ -653,7 +680,7 @@ def send_ticket_mail(
             to=", ".join(to_list),
             cc=", ".join(cc_list) or None,
             sender="Agent",
-            content_type="text/plain",
+            content_type=ArticleContentType.PLAIN,
         )
     )
     _log_outbound_mail("send_ticket_mail", ticket_id, to_list, cc_list, subject_clean)
@@ -730,6 +757,7 @@ def create_ticket_with_mail(
             article_body=body,
             article_type=ArticleType.EMAIL,
             article_internal=False,
+            article_content_type=ArticleContentType.PLAIN,
             article_to=", ".join(to_list),
             article_cc=", ".join(cc_list) or None,
         )
@@ -1533,7 +1561,10 @@ def escalation_summary(group: str, locale: str) -> str:
 
 
 def main() -> None:
-    """Run the MCP server."""
+    """Run the MCP server, or `login` to complete a Zammad OAuth callback."""
+    if len(sys.argv) > 1 and sys.argv[1] == "login":
+        run_oauth_login_cli(sys.argv[2:])
+        return
     args = parse_server_args()
 
     # structlog's stdlib filter drops everything below the root logger level (WARNING by

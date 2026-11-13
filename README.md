@@ -64,15 +64,15 @@ Connecting a large language model to a real helpdesk usually means writing a bes
 The MCP server talks to Zammad through the **REST API**. No Zammad-side plugin is
 required. Full matrix: **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
 
-| Zammad version  | Status                                      |
-| --------------- | ------------------------------------------- |
-| **7.2.2**       | **Current** (default dev stack)             |
-| **7.2.x**       | **Compatible**                              |
-| **7.1**         | **Tested**                                  |
-| **7.0**         | **Tested**                                  |
-| **6.5.x**       | **Compatible**                              |
-| **6.0 – 6.4.x** | **Compatible** (minimum supported line)     |
-| **&lt; 6.0**    | Not supported                               |
+| Zammad version  | Status                                  |
+| --------------- | --------------------------------------- |
+| **7.2.2**       | **Current** (default dev stack)         |
+| **7.2.x**       | **Compatible**                          |
+| **7.1**         | **Tested**                              |
+| **7.0**         | **Tested**                              |
+| **6.5.x**       | **Compatible**                          |
+| **6.0 – 6.4.x** | **Compatible** (minimum supported line) |
+| **&lt; 6.0**    | Not supported                           |
 
 **MCP package vs Zammad:** `zammad-mcp-server` on PyPI is versioned independently
 (`0.2.x`). One MCP release works with every supported Zammad version — set
@@ -110,9 +110,9 @@ Full guides, security checklists, and deployment notes live on the Open Ticket A
 - **[Zammad 7 native AI](https://openticketai.com/en/docs/blog/zammad-ai-zammad-7-ki-funktionen-leitfaden/)** — built-in summaries and writing assistant inside the Zammad UI.
 - **Zammad MCP Server (this project)** — connects **external** MCP clients (Claude Desktop, Cursor, custom agents) to Zammad.
 - **[Zammad Commander](https://github.com/Softoft-Orga/zammad-commander)** — **browser chat UI** (LibreChat + this MCP server + your Zammad). No Cursor required; `docker compose up` for internal admin chat. See [Zammad Commander (browser chat UI)](#zammad-commander-browser-chat-ui).
-- **[Open Ticket AI Runtime](https://openticketai.com/en/docs/otai-runtime/)** — on-prem inference with **custom-trained** models via the OTAI Zammad connector ([integration guide](https://openticketai.com/en/docs/blog/integrating-zammad-open-ticket-ai/)).
+- **[Open Ticket AI](https://openticketai.com/en/solutions/zammad/)** — on-prem classification, summaries, and reply drafts from your helpdesk setup (groups, priorities, categories). No model training. See the [integration guide](https://openticketai.com/en/docs/blog/integrating-zammad-open-ticket-ai/).
 
-All three can coexist. MCP is the fastest path to “talk to my helpdesk from Claude.” Want a **team chat UI** instead of an IDE? Use **[Zammad Commander](https://github.com/Softoft-Orga/zammad-commander)**. Need custom models on your queues? See [Open Ticket AI for Zammad](https://openticketai.com/en/solutions/zammad/).
+All four can run side by side. MCP is the fastest path to “talk to my helpdesk from Claude.” Want a **team chat UI** instead of an IDE? Use **[Zammad Commander](https://github.com/Softoft-Orga/zammad-commander)**. Want classification on your own infrastructure? See [Open Ticket AI for Zammad](https://openticketai.com/en/solutions/zammad/).
 
 ## Quick Start
 
@@ -402,11 +402,21 @@ ZAMMAD_HTTP_TOKEN=your_token_here
 
 Create tokens in Zammad: **Profile** → **Token Access**
 
-### 2. OAuth2 Token
+### 2. OAuth2
+
+`ZAMMAD_OAUTH2_TOKEN` is a bearer token. Obtain one with a browser login (the callback must be registered on a Zammad OAuth application under **Admin → System → API**):
+
+```bash
+zammad-mcp-server login --url https://helpdesk.example.com --client-id YOUR_CLIENT_ID
+```
+
+The command listens on `http://127.0.0.1:8765/callback`, then prints `ZAMMAD_OAUTH2_TOKEN=...`. Paste that into the MCP client env. A token you already hold can be set directly:
 
 ```env
 ZAMMAD_OAUTH2_TOKEN=your_oauth_token
 ```
+
+Personal access tokens stay on `ZAMMAD_HTTP_TOKEN` (`Authorization: Token token=...`). See [Zammad API authentication](https://docs.zammad.org/en/latest/api/intro.html).
 
 ### 3. Username/Password
 
@@ -452,15 +462,15 @@ zammad-mcp-server
 Published images are on **GitHub Container Registry** (`ghcr.io`):
 
 ```bash
-docker pull ghcr.io/softoft-orga/zammad-mcp-server:latest
+docker pull ghcr.io/openticketai/zammad-mcp-server:latest
 
 docker run -p 8000:8000 \
   -e ZAMMAD_URL=https://your-zammad.com \
   -e ZAMMAD_HTTP_TOKEN=your_token \
-  ghcr.io/softoft-orga/zammad-mcp-server:latest
+  ghcr.io/openticketai/zammad-mcp-server:latest
 
 # Override to legacy SSE if needed:
-# docker run ... ghcr.io/softoft-orga/zammad-mcp-server:latest \
+# docker run ... ghcr.io/openticketai/zammad-mcp-server:latest \
 #   zammad-mcp-server --transport sse --host 0.0.0.0 --port 8000
 ```
 

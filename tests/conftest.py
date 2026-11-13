@@ -269,21 +269,9 @@ def zammad_api_mock(respx_mock: respx.MockRouter) -> respx.MockRouter:
     """Setup common Zammad API mock routes."""
     base_url = "http://test-zammad.local/api/v1"
 
-    # Health check
-    respx_mock.get(f"{base_url}/ping").mock(
-        return_value=Response(200, json={"version": "6.0.0", " pong": "pong"})
-    )
-
-    # Server info
-    respx_mock.get(f"{base_url}/system/").mock(
-        return_value=Response(
-            200,
-            json={
-                "version": "6.0.0",
-                "product_name": "Zammad",
-                "settings": {},
-            },
-        )
+    # Health and version. Zammad has no /api/v1/ping or /api/v1/system.
+    respx_mock.get(f"{base_url}/version").mock(
+        return_value=Response(200, json={"version": "7.2.2"})
     )
 
     # Ticket search must be registered before the generic /tickets/ prefix.
